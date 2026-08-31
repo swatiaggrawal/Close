@@ -99,7 +99,7 @@ def test_search_finds_relevant_doc():
 def test_search_competitor_query_surfaces_comparison_doc():
     r = client.post("/tools/search_service_info", json={"query": "how do you compare to other agencies"})
     titles = [res["title"] for res in r.json()["results"]]
-    assert "How NR Consulting Compares" in titles
+    assert "How Talentbridge Consulting Compares" in titles
 
 
 def test_search_always_returns_top_two():

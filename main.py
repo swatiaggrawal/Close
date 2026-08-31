@@ -15,7 +15,7 @@ turn -- too slow for real-time voice. Agora's native Custom Tools path
 has gpt-4o-mini call these endpoints directly, no adapter, no double
 LLM hop, no tunnel-reachability mystery.
 
-DEMO SCENARIO (NR Consulting):
+DEMO SCENARIO (Talentbridge Consulting):
 Close is a voice sales/qualification agent for a staffing & recruitment
 consultancy. A client calls in looking to hire finance professionals,
 changes headcount mid-call, asks about pricing, adds an IT hiring
@@ -140,7 +140,7 @@ _SERVICE_DOCS = [
         "id": "finance-staffing",
         "title": "Finance Staffing Service",
         "text": (
-            "NR Consulting sources finance professionals including accountants, "
+            "Talentbridge Consulting sources finance professionals including accountants, "
             "financial analysts, controllers, and CFO-level candidates. Standard "
             "placements are filled within 3 to 4 weeks. All candidates are "
             "pre-screened with a 90-day replacement guarantee."
@@ -150,7 +150,7 @@ _SERVICE_DOCS = [
         "id": "it-staffing",
         "title": "IT Staffing Service",
         "text": (
-            "NR Consulting places IT roles including software engineers, DevOps, "
+            "Talentbridge Consulting places IT roles including software engineers, DevOps, "
             "QA, and IT project managers. Typical time-to-fill is 2 to 3 weeks for "
             "mid-level roles and up to 6 weeks for specialized senior roles. "
             "Includes technical screening before candidates are presented."
@@ -167,9 +167,9 @@ _SERVICE_DOCS = [
     },
     {
         "id": "competitor-comparison",
-        "title": "How NR Consulting Compares",
+        "title": "How Talentbridge Consulting Compares",
         "text": (
-            "Unlike flat-fee staffing agencies, NR Consulting offers volume-based "
+            "Unlike flat-fee staffing agencies, Talentbridge Consulting offers volume-based "
             "pricing that reduces per-candidate cost as headcount grows, and "
             "every placement includes a replacement guarantee window, which many "
             "competitors charge extra for."
@@ -181,7 +181,7 @@ _SERVICE_DOCS = [
         "text": (
             "If a placed candidate leaves or is let go within the guarantee "
             "window (90 days for finance/IT, 12 months for executive search), "
-            "NR Consulting provides a replacement at no additional placement fee."
+            "Talentbridge Consulting provides a replacement at no additional placement fee."
         ),
     },
 ]
@@ -199,7 +199,7 @@ class ServiceInfoRequest(BaseModel):
 
 @app.post("/tools/search_service_info")
 async def search_service_info(req: ServiceInfoRequest):
-    """Agora Custom Tool: search NR Consulting's service info (staffing
+    """Agora Custom Tool: search Talentbridge Consulting's service info (staffing
     services, guarantees, timelines, competitor comparisons) to answer
     a client question accurately instead of guessing."""
     scored = sorted(_SERVICE_DOCS, key=lambda d: _score(req.query, d["title"] + " " + d["text"]), reverse=True)
@@ -221,7 +221,7 @@ class BookMeetingRequest(BaseModel):
 
 @app.post("/tools/book_meeting")
 async def book_meeting(req: BookMeetingRequest):
-    """Agora Custom Tool: book a meeting with the NR Consulting
+    """Agora Custom Tool: book a meeting with the Talentbridge Consulting
     recruitment team once the client is ready to move forward."""
     record = {
         "status": "booked",

@@ -1,4 +1,4 @@
-# Close -- Agora-Native Backend (NR Consulting recruitment demo)
+# Close -- Agora-Native Backend (Talentbridge Consulting recruitment demo)
 
 Architecture: Agora's own managed LLM (`gpt-4o-mini`) handles all
 conversation reasoning, memory, turn-taking, and interruption handling
@@ -80,7 +80,7 @@ Go to your agent config → **Actions tab** → **Custom Tools** → **Add Tool*
 ### Tool 2: search_service_info
 - **Endpoint:** `https://<your-url>/tools/search_service_info`
 - **Method:** POST
-- **Description:** "Search NR Consulting's service info, guarantees, timelines, and competitor comparisons. Call this for any factual question you're not certain about instead of guessing."
+- **Description:** "Search Talentbridge Consulting's service info, guarantees, timelines, and competitor comparisons. Call this for any factual question you're not certain about instead of guessing."
 - **Parameters:**
   ```json
   {
