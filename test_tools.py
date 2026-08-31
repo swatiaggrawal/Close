@@ -1,0 +1,185 @@
+"""
+Automated tool-correctness tests for Close's backend.
+
+IMPORTANT SCOPE NOTE (be honest about this in your submission/demo):
+These tests check that OUR code is correct -- pricing math, discount
+tiers, logging, schema handling, retrieval scoring. They do NOT test
+conversational behavior (memory across turns, interruption handling,
+objection handling), because that reasoning now lives entirely inside
+Agora's managed gpt-4o-mini, not in this codebase. Testing THAT
+requires actually talking to the live agent -- see
+MANUAL_VOICE_TEST_SCRIPT.md for the scripted checklist to run through
+Agora Console or a real call.
+
+This is the correct and honest split for this architecture: unit-test
+what you control, live-test what Agora controls. Don't claim these
+automated tests cover conversational intelligence -- they don't and
+can't, by design of the pivot to Agora-native tool calling.
+
+Run:
+    pip install pytest httpx --break-system-packages
+    pytest test_tools.py -v
+"""
+
+from fastapi.testclient import TestClient
+from main import app
+
+client = TestClient(app)
+
+
+# ---------------------------------------------------------------------
+# get_staffing_quote
+# ---------------------------------------------------------------------
+
+def test_quote_basic_finance():
+    r = client.post("/tools/get_staffing_quote", json={"service_type": "finance", "num_candidates": 5})
+    data = r.json()
+    assert r.status_code == 200
+    assert data["base_rate_per_candidate_usd"] == 1200
+    assert data["volume_discount_pct"] == 0
+    assert data["total_estimate_usd"] == 6000.0
+
+
+def test_quote_volume_discount_20_tier():
+    r = client.post("/tools/get_staffing_quote", json={"service_type": "finance", "num_candidates": 20})
+    data = r.json()
+    assert data["volume_discount_pct"] == 10
+    assert data["final_rate_per_candidate_usd"] == 1080.0
+    assert data["total_estimate_usd"] == 21600.0
+
+
+def test_quote_volume_discount_50_tier():
+    r = client.post("/tools/get_staffing_quote", json={"service_type": "finance", "num_candidates": 50})
+    data = r.json()
+    assert data["volume_discount_pct"] == 20
+    assert data["final_rate_per_candidate_usd"] == 960.0
+    assert data["total_estimate_usd"] == 48000.0
+
+
+def test_quote_it_rate():
+    r = client.post("/tools/get_staffing_quote", json={"service_type": "it", "num_candidates": 10})
+    data = r.json()
+    assert data["base_rate_per_candidate_usd"] == 1800
+    assert data["total_estimate_usd"] == 18000.0
+
+
+def test_quote_executive_rate():
+    r = client.post("/tools/get_staffing_quote", json={"service_type": "executive", "num_candidates": 2})
+    data = r.json()
+    assert data["base_rate_per_candidate_usd"] == 4500
+
+
+def test_quote_case_insensitive_service_type():
+    r = client.post("/tools/get_staffing_quote", json={"service_type": "FINANCE", "num_candidates": 5})
+    assert r.json()["service_type"] == "finance"
+
+
+def test_quote_unknown_service_type_returns_error_not_crash():
+    r = client.post("/tools/get_staffing_quote", json={"service_type": "marketing", "num_candidates": 5})
+    assert r.status_code == 200  # should not 500 -- graceful error in the payload
+    assert "error" in r.json()
+
+
+def test_quote_missing_field_returns_422():
+    r = client.post("/tools/get_staffing_quote", json={"service_type": "finance"})
+    assert r.status_code == 422  # pydantic validation, not a silent failure
+
+
+# ---------------------------------------------------------------------
+# search_service_info
+# ---------------------------------------------------------------------
+
+def test_search_finds_relevant_doc():
+    r = client.post("/tools/search_service_info", json={"query": "finance professionals guarantee"})
+    data = r.json()
+    titles = [res["title"] for res in data["results"]]
+    assert "Finance Staffing Service" in titles
+
+
+def test_search_competitor_query_surfaces_comparison_doc():
+    r = client.post("/tools/search_service_info", json={"query": "how do you compare to other agencies"})
+    titles = [res["title"] for res in r.json()["results"]]
+    assert "How NR Consulting Compares" in titles
+
+
+def test_search_always_returns_top_two():
+    r = client.post("/tools/search_service_info", json={"query": "hiring"})
+    assert len(r.json()["results"]) == 2
+
+
+# ---------------------------------------------------------------------
+# book_meeting
+# ---------------------------------------------------------------------
+
+def test_book_meeting_basic():
+    r = client.post("/tools/book_meeting", json={"customer_name": "Ananya Rao", "preferred_time": "Thursday 3pm"})
+    data = r.json()
+    assert data["status"] == "booked"
+    assert data["customer_name"] == "Ananya Rao"
+    assert data["meeting_type"] == "recruitment team demo"  # default applied
+
+
+def test_book_meeting_custom_type():
+    r = client.post("/tools/book_meeting", json={
+        "customer_name": "Ananya Rao", "preferred_time": "Friday 11am", "meeting_type": "contract review",
+    })
+    assert r.json()["meeting_type"] == "contract review"
+
+
+# ---------------------------------------------------------------------
+# create_lead
+# ---------------------------------------------------------------------
+
+def test_create_lead_basic():
+    r = client.post("/tools/create_lead", json={
+        "customer_name": "Ananya Rao", "email": "ananya@example.com", "requirements_summary": "50 finance + IT hires",
+    })
+    data = r.json()
+    assert data["status"] == "lead_logged"
+    assert data["requirements_summary"] == "50 finance + IT hires"
+
+
+def test_create_lead_optional_fields_default_empty():
+    r = client.post("/tools/create_lead", json={"customer_name": "Ananya Rao"})
+    data = r.json()
+    assert data["email"] == ""
+    assert data["requirements_summary"] == ""
+
+
+# ---------------------------------------------------------------------
+# escalate_to_human
+# ---------------------------------------------------------------------
+
+def test_escalate_basic():
+    r = client.post("/tools/escalate_to_human", json={
+        "reason": "client requested legal review",
+        "conversation_summary": "Client wants 50 finance hires, asked about custom contract terms",
+    })
+    data = r.json()
+    assert data["status"] == "escalated"
+    assert "specialist" in data["message"].lower()
+
+
+def test_escalate_requires_summary():
+    r = client.post("/tools/escalate_to_human", json={"reason": "client requested legal review"})
+    assert r.status_code == 422  # conversation_summary is required, not silently skipped
+
+
+# ---------------------------------------------------------------------
+# health + logging
+# ---------------------------------------------------------------------
+
+def test_health_lists_all_five_tools():
+    r = client.get("/health")
+    tools = r.json()["tools"]
+    assert set(tools) == {
+        "get_staffing_quote", "search_service_info", "book_meeting", "create_lead", "escalate_to_human",
+    }
+
+
+def test_calls_get_logged_and_are_readable():
+    client.post("/tools/get_staffing_quote", json={"service_type": "finance", "num_candidates": 5})
+    r = client.get("/logs/calls?limit=1")
+    logs = r.json()["logs"]
+    assert len(logs) == 1
+    assert logs[-1]["tool"] == "get_staffing_quote"
