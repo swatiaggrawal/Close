@@ -46,7 +46,9 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 logging.basicConfig(level=logging.INFO)
@@ -60,6 +62,28 @@ CALL_LOG_PATH = LOG_DIR / "tool_calls.jsonl"
 ESCALATION_LOG_PATH = LOG_DIR / "escalations.jsonl"
 CRM_LOG_PATH = LOG_DIR / "crm_leads.jsonl"
 CALENDAR_LOG_PATH = LOG_DIR / "calendar_bookings.jsonl"
+ERROR_LOG_PATH = LOG_DIR / "request_errors.jsonl"
+
+
+@app.exception_handler(RequestValidationError)
+async def log_validation_errors(request: Request, exc: RequestValidationError):
+    """Without this, a malformed/mismatched request from Agora just 422s
+    silently and NEVER reaches log_tool_call() -- meaning failed tool
+    calls are invisible in /logs/calls. This makes failures visible so
+    'it didn't work' turns into 'here's exactly what field was wrong.'"""
+    try:
+        raw_body = (await request.body()).decode("utf-8", errors="replace")
+    except Exception:
+        raw_body = "<could not read body>"
+    record = {
+        "path": str(request.url.path),
+        "errors": exc.errors(),
+        "raw_body_received": raw_body,
+        "timestamp": time.time(),
+    }
+    append_jsonl(ERROR_LOG_PATH, record)
+    logger.error(f"[validation_error] {request.url.path} -> {exc.errors()} | raw body: {raw_body}")
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 
 def append_jsonl(path: Path, record: dict):
@@ -86,9 +110,11 @@ def log_tool_call(tool_name: str, args: dict, result: dict):
 # ---------------------------------------------------------------------
 
 _SERVICE_RATES = {
-    "finance": 1200,   # per-candidate placement fee, USD
+    "finance": 1200,    # per-candidate placement fee, USD
     "it": 1800,
     "executive": 4500,
+    "marketing": 1000,
+    "media": 950,
 }
 
 
@@ -100,12 +126,12 @@ class StaffingQuoteRequest(BaseModel):
 @app.post("/tools/get_staffing_quote")
 async def get_staffing_quote(req: StaffingQuoteRequest):
     """Agora Custom Tool: get a pricing quote for a staffing service.
-    service_type must be one of: finance, it, executive."""
+    service_type must be one of: finance, it, executive, marketing, media."""
     key = req.service_type.lower().strip()
     rate = _SERVICE_RATES.get(key)
 
     if rate is None:
-        result = {"error": f"Unknown service_type '{req.service_type}'. Valid types: finance, it, executive."}
+        result = {"error": f"Unknown service_type '{req.service_type}'. Valid types: finance, it, executive, marketing, media."}
         log_tool_call("get_staffing_quote", req.model_dump(), result)
         return result
 
@@ -163,6 +189,27 @@ _SERVICE_DOCS = [
             "Executive search covers VP-level and C-suite hires. Engagements are "
             "retained, run 6 to 10 weeks, and include a dedicated search "
             "consultant and a 12-month replacement guarantee."
+        ),
+    },
+    {
+        "id": "marketing-staffing",
+        "title": "Marketing Staffing Service",
+        "text": (
+            "Talentbridge Consulting places marketing roles including content "
+            "strategists, growth marketers, brand managers, and marketing "
+            "coordinators. Typical time-to-fill is 2 to 4 weeks. Candidates are "
+            "screened for portfolio quality and campaign experience relevant to "
+            "the client's industry."
+        ),
+    },
+    {
+        "id": "media-staffing",
+        "title": "Media Staffing Service",
+        "text": (
+            "Talentbridge Consulting sources media professionals including "
+            "editors, video producers, and social media managers. Time-to-fill "
+            "is typically 2 to 3 weeks. All media placements include the "
+            "standard 90-day replacement guarantee."
         ),
     },
     {
@@ -319,3 +366,14 @@ async def get_call_logs(limit: int = 20):
         return {"logs": []}
     lines = CALL_LOG_PATH.read_text().strip().splitlines()
     return {"logs": [json.loads(l) for l in lines[-limit:]] if lines else []}
+
+
+@app.get("/logs/errors")
+async def get_error_logs(limit: int = 20):
+    """Check this whenever a tool 'silently fails' during a live test --
+    it shows the EXACT payload Agora sent and why it was rejected,
+    instead of guessing from a spoken 'there was an issue' response."""
+    if not ERROR_LOG_PATH.exists():
+        return {"errors": []}
+    lines = ERROR_LOG_PATH.read_text().strip().splitlines()
+    return {"errors": [json.loads(l) for l in lines[-limit:]] if lines else []}

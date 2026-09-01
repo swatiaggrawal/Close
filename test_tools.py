@@ -75,7 +75,7 @@ def test_quote_case_insensitive_service_type():
 
 
 def test_quote_unknown_service_type_returns_error_not_crash():
-    r = client.post("/tools/get_staffing_quote", json={"service_type": "marketing", "num_candidates": 5})
+    r = client.post("/tools/get_staffing_quote", json={"service_type": "legal", "num_candidates": 5})
     assert r.status_code == 200  # should not 500 -- graceful error in the payload
     assert "error" in r.json()
 
@@ -83,6 +83,27 @@ def test_quote_unknown_service_type_returns_error_not_crash():
 def test_quote_missing_field_returns_422():
     r = client.post("/tools/get_staffing_quote", json={"service_type": "finance"})
     assert r.status_code == 422  # pydantic validation, not a silent failure
+
+
+def test_quote_marketing_rate():
+    r = client.post("/tools/get_staffing_quote", json={"service_type": "marketing", "num_candidates": 5})
+    assert r.json()["base_rate_per_candidate_usd"] == 1000
+
+
+def test_quote_media_rate():
+    r = client.post("/tools/get_staffing_quote", json={"service_type": "media", "num_candidates": 5})
+    assert r.json()["base_rate_per_candidate_usd"] == 950
+
+
+def test_validation_error_gets_logged():
+    """This is the fix for the 'book_meeting silently failed' bug -- a
+    malformed request should now show up in /logs/errors instead of
+    vanishing with no trace."""
+    client.post("/tools/get_staffing_quote", json={"service_type": "finance"})  # missing num_candidates
+    r = client.get("/logs/errors?limit=1")
+    errors = r.json()["errors"]
+    assert len(errors) >= 1
+    assert errors[-1]["path"] == "/tools/get_staffing_quote"
 
 
 # ---------------------------------------------------------------------
