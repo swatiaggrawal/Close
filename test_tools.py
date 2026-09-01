@@ -181,6 +181,19 @@ def test_escalate_basic():
     assert "specialist" in data["message"].lower()
 
 
+def test_escalate_without_email_config_does_not_crash():
+    """No RESEND_API_KEY/ESCALATION_EMAIL_TO set in test environment --
+    escalation must still succeed and log gracefully, not error out."""
+    r = client.post("/tools/escalate_to_human", json={
+        "reason": "test reason", "conversation_summary": "test summary",
+    })
+    assert r.status_code == 200
+    r2 = client.get("/logs/calls?limit=1")
+    last = r2.json()["logs"][-1]
+    assert last["tool"] == "escalate_to_human"
+    assert last["result"]["email"]["sent"] is False  # expected: not configured in test env
+
+
 def test_escalate_requires_summary():
     r = client.post("/tools/escalate_to_human", json={"reason": "client requested legal review"})
     assert r.status_code == 422  # conversation_summary is required, not silently skipped

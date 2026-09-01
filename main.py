@@ -40,12 +40,14 @@ Then expose publicly (ngrok for quick testing, Render for anything you
 actually demo on -- see README for why).
 """
 
+import os
 import time
 import json
 import logging
 from pathlib import Path
 from typing import Optional
 
+import requests
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -63,6 +65,55 @@ ESCALATION_LOG_PATH = LOG_DIR / "escalations.jsonl"
 CRM_LOG_PATH = LOG_DIR / "crm_leads.jsonl"
 CALENDAR_LOG_PATH = LOG_DIR / "calendar_bookings.jsonl"
 ERROR_LOG_PATH = LOG_DIR / "request_errors.jsonl"
+
+# ---------------------------------------------------------------------
+# Real escalation email (Resend). This is the one "simulated" feature
+# upgraded to something genuinely real for this round: escalating a
+# call now actually sends an email, not just a local log line.
+#
+# Setup (2 minutes):
+#   1. Sign up free at https://resend.com
+#   2. Copy your API key, set env var RESEND_API_KEY on Render
+#   3. Set env var ESCALATION_EMAIL_TO to the inbox that should receive
+#      handoffs (their sandbox sender can email your own verified
+#      account address with zero domain setup -- perfect for a demo)
+# If these env vars aren't set, escalation still works exactly as
+# before (logs locally) -- it just skips the email step silently
+# rather than crashing the demo.
+# ---------------------------------------------------------------------
+
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "")
+ESCALATION_EMAIL_TO = os.environ.get("ESCALATION_EMAIL_TO", "")
+ESCALATION_EMAIL_FROM = os.environ.get("ESCALATION_EMAIL_FROM", "onboarding@resend.dev")
+
+
+def send_escalation_email(reason: str, conversation_summary: str) -> dict:
+    """Sends a real email via Resend. Returns a status dict; NEVER
+    raises -- a flaky email API should never take down the call."""
+    if not RESEND_API_KEY or not ESCALATION_EMAIL_TO:
+        return {"sent": False, "detail": "email not configured (missing RESEND_API_KEY or ESCALATION_EMAIL_TO)"}
+
+    try:
+        resp = requests.post(
+            "https://api.resend.com/emails",
+            headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
+            json={
+                "from": f"Close (Talentbridge Consulting) <{ESCALATION_EMAIL_FROM}>",
+                "to": [ESCALATION_EMAIL_TO],
+                "subject": f"Call escalation: {reason[:80]}",
+                "text": (
+                    f"A live call was escalated to a human specialist.\n\n"
+                    f"Reason: {reason}\n\n"
+                    f"Conversation summary:\n{conversation_summary}\n"
+                ),
+            },
+            timeout=10,
+        )
+        if resp.status_code >= 400:
+            return {"sent": False, "detail": f"Resend returned {resp.status_code}: {resp.text[:200]}"}
+        return {"sent": True, "detail": "email dispatched"}
+    except Exception as e:
+        return {"sent": False, "detail": f"email send failed: {e}"}
 
 
 @app.exception_handler(RequestValidationError)
@@ -325,10 +376,13 @@ async def escalate_to_human(req: EscalateRequest):
     legal/contract questions, stalled objections, or unusually large
     deals. Always include a conversation_summary so the human doesn't
     need the client to repeat themselves."""
+    email_result = send_escalation_email(req.reason, req.conversation_summary)
+
     record = {
         "status": "escalated",
         "reason": req.reason,
         "conversation_summary": req.conversation_summary,
+        "email": email_result,
         "logged_at": time.time(),
     }
     append_jsonl(ESCALATION_LOG_PATH, record)
@@ -336,7 +390,7 @@ async def escalate_to_human(req: EscalateRequest):
         "status": "escalated",
         "message": "A recruitment specialist has the full context and will join or follow up shortly.",
     }
-    log_tool_call("escalate_to_human", req.model_dump(), response)
+    log_tool_call("escalate_to_human", req.model_dump(), {**response, "email": email_result})
     return response
 
 
