@@ -87,7 +87,7 @@ ESCALATION_EMAIL_TO = os.environ.get("ESCALATION_EMAIL_TO", "")
 ESCALATION_EMAIL_FROM = os.environ.get("ESCALATION_EMAIL_FROM", "onboarding@resend.dev")
 
 
-def send_escalation_email(reason: str, conversation_summary: str) -> dict:
+def send_escalation_email(reason: str, conversation_summary: str, customer_name: str, contact_info: str) -> dict:
     """Sends a real email via Resend. Returns a status dict; NEVER
     raises -- a flaky email API should never take down the call."""
     if not RESEND_API_KEY or not ESCALATION_EMAIL_TO:
@@ -100,9 +100,11 @@ def send_escalation_email(reason: str, conversation_summary: str) -> dict:
             json={
                 "from": f"Close (Talentbridge Consulting) <{ESCALATION_EMAIL_FROM}>",
                 "to": [ESCALATION_EMAIL_TO],
-                "subject": f"Call escalation: {reason[:80]}",
+                "subject": f"Call escalation: {customer_name} -- {reason[:60]}",
                 "text": (
                     f"A live call was escalated to a human specialist.\n\n"
+                    f"Client name: {customer_name}\n"
+                    f"Contact info: {contact_info}\n\n"
                     f"Reason: {reason}\n\n"
                     f"Conversation summary:\n{conversation_summary}\n"
                 ),
@@ -367,6 +369,8 @@ async def create_lead(req: CreateLeadRequest):
 class EscalateRequest(BaseModel):
     reason: str
     conversation_summary: str
+    customer_name: Optional[str] = "Not provided"
+    contact_info: Optional[str] = "Not provided"
 
 
 @app.post("/tools/escalate_to_human")
@@ -375,13 +379,20 @@ async def escalate_to_human(req: EscalateRequest):
     specialist. Use for explicit requests to speak to a person,
     legal/contract questions, stalled objections, or unusually large
     deals. Always include a conversation_summary so the human doesn't
-    need the client to repeat themselves."""
-    email_result = send_escalation_email(req.reason, req.conversation_summary)
+    need the client to repeat themselves, AND always try to capture
+    customer_name and contact_info (email or phone) before escalating
+    -- ask for these explicitly if the client hasn't already given
+    them, so the specialist knows who to follow up with."""
+    email_result = send_escalation_email(
+        req.reason, req.conversation_summary, req.customer_name, req.contact_info
+    )
 
     record = {
         "status": "escalated",
         "reason": req.reason,
         "conversation_summary": req.conversation_summary,
+        "customer_name": req.customer_name,
+        "contact_info": req.contact_info,
         "email": email_result,
         "logged_at": time.time(),
     }

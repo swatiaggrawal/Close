@@ -175,10 +175,28 @@ def test_escalate_basic():
     r = client.post("/tools/escalate_to_human", json={
         "reason": "client requested legal review",
         "conversation_summary": "Client wants 50 finance hires, asked about custom contract terms",
+        "customer_name": "Ananya Rao",
+        "contact_info": "ananya@example.com",
     })
     data = r.json()
     assert data["status"] == "escalated"
     assert "specialist" in data["message"].lower()
+
+
+def test_escalate_defaults_when_contact_details_missing():
+    """If the LLM escalates without capturing name/contact (shouldn't
+    happen per the tool description, but must not crash if it does),
+    these should default to a clear 'Not provided' rather than blank
+    or missing fields in the email/log."""
+    r = client.post("/tools/escalate_to_human", json={
+        "reason": "client requested legal review",
+        "conversation_summary": "Client wants 50 finance hires",
+    })
+    assert r.status_code == 200
+    r2 = client.get("/logs/calls?limit=1")
+    last = r2.json()["logs"][-1]
+    assert last["args"]["customer_name"] == "Not provided"
+    assert last["args"]["contact_info"] == "Not provided"
 
 
 def test_escalate_without_email_config_does_not_crash():
@@ -186,6 +204,7 @@ def test_escalate_without_email_config_does_not_crash():
     escalation must still succeed and log gracefully, not error out."""
     r = client.post("/tools/escalate_to_human", json={
         "reason": "test reason", "conversation_summary": "test summary",
+        "customer_name": "Test User", "contact_info": "test@example.com",
     })
     assert r.status_code == 200
     r2 = client.get("/logs/calls?limit=1")
