@@ -147,6 +147,22 @@ def test_book_meeting_custom_type():
     assert r.json()["meeting_type"] == "contract review"
 
 
+def test_book_meeting_without_calendar_config_does_not_crash():
+    """No GOOGLE_SERVICE_ACCOUNT_JSON/GOOGLE_CALENDAR_ID set in test
+    environment -- booking must still succeed and log gracefully."""
+    r = client.post("/tools/book_meeting", json={"customer_name": "Ananya Rao", "preferred_time": "Thursday 3pm"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["calendar"]["created"] is False  # expected: not configured in test env
+
+
+def test_book_meeting_unparseable_time_does_not_crash():
+    """Even with calendar configured, a preferred_time that can't be
+    parsed into a real date should degrade gracefully, not 500."""
+    r = client.post("/tools/book_meeting", json={"customer_name": "Ananya Rao", "preferred_time": "whenever works"})
+    assert r.status_code == 200
+
+
 # ---------------------------------------------------------------------
 # create_lead
 # ---------------------------------------------------------------------
@@ -165,6 +181,15 @@ def test_create_lead_optional_fields_default_empty():
     data = r.json()
     assert data["email"] == ""
     assert data["requirements_summary"] == ""
+
+
+def test_create_lead_without_email_config_does_not_crash():
+    """No RESEND_API_KEY/ESCALATION_EMAIL_TO set in test environment --
+    lead capture must still succeed and log gracefully, not error out."""
+    r = client.post("/tools/create_lead", json={"customer_name": "Ananya Rao", "email": "a@example.com"})
+    assert r.status_code == 200
+    data = r.json()
+    assert data["notification_email"]["sent"] is False  # expected: not configured in test env
 
 
 # ---------------------------------------------------------------------

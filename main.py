@@ -44,10 +44,14 @@ import os
 import time
 import json
 import logging
+from datetime import timedelta
 from pathlib import Path
 from typing import Optional
 
 import requests
+import dateparser
+from google.oauth2 import service_account
+from googleapiclient.discovery import build as google_build
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
@@ -87,9 +91,10 @@ ESCALATION_EMAIL_TO = os.environ.get("ESCALATION_EMAIL_TO", "")
 ESCALATION_EMAIL_FROM = os.environ.get("ESCALATION_EMAIL_FROM", "onboarding@resend.dev")
 
 
-def send_escalation_email(reason: str, conversation_summary: str, customer_name: str, contact_info: str) -> dict:
+def send_notification_email(subject: str, body_text: str) -> dict:
     """Sends a real email via Resend. Returns a status dict; NEVER
-    raises -- a flaky email API should never take down the call."""
+    raises -- a flaky email API should never take down the call.
+    Shared by escalation and lead-capture notifications."""
     if not RESEND_API_KEY or not ESCALATION_EMAIL_TO:
         return {"sent": False, "detail": "email not configured (missing RESEND_API_KEY or ESCALATION_EMAIL_TO)"}
 
@@ -100,14 +105,8 @@ def send_escalation_email(reason: str, conversation_summary: str, customer_name:
             json={
                 "from": f"Close (Talentbridge Consulting) <{ESCALATION_EMAIL_FROM}>",
                 "to": [ESCALATION_EMAIL_TO],
-                "subject": f"Call escalation: {customer_name} -- {reason[:60]}",
-                "text": (
-                    f"A live call was escalated to a human specialist.\n\n"
-                    f"Client name: {customer_name}\n"
-                    f"Contact info: {contact_info}\n\n"
-                    f"Reason: {reason}\n\n"
-                    f"Conversation summary:\n{conversation_summary}\n"
-                ),
+                "subject": subject,
+                "text": body_text,
             },
             timeout=10,
         )
@@ -116,6 +115,121 @@ def send_escalation_email(reason: str, conversation_summary: str, customer_name:
         return {"sent": True, "detail": "email dispatched"}
     except Exception as e:
         return {"sent": False, "detail": f"email send failed: {e}"}
+
+
+def send_escalation_email(reason: str, conversation_summary: str, customer_name: str, contact_info: str) -> dict:
+    subject = f"Call escalation: {customer_name} -- {reason[:60]}"
+    body = (
+        f"A live call was escalated to a human specialist.\n\n"
+        f"Client name: {customer_name}\n"
+        f"Contact info: {contact_info}\n\n"
+        f"Reason: {reason}\n\n"
+        f"Conversation summary:\n{conversation_summary}\n"
+    )
+    return send_notification_email(subject, body)
+
+
+def send_lead_email(customer_name: str, email: str, requirements_summary: str) -> dict:
+    subject = f"New lead captured: {customer_name}"
+    body = (
+        f"A new lead was captured by Close.\n\n"
+        f"Client name: {customer_name}\n"
+        f"Client email: {email or 'Not provided'}\n\n"
+        f"Requirements:\n{requirements_summary or 'Not yet specified'}\n"
+    )
+    return send_notification_email(subject, body)
+
+
+# ---------------------------------------------------------------------
+# Real calendar booking (Google Calendar API). This is the second
+# "simulated -> real" upgrade: book_meeting now creates an actual
+# calendar event when configured, not just a local log line.
+#
+# Setup (~30-45 min, one time):
+#   1. In Google Cloud Console: enable the Calendar API for a project.
+#   2. Create a Service Account, download its JSON key.
+#   3. Share your Google Calendar with that service account's email
+#      (grant "Make changes to events" permission).
+#   4. Set env vars on Render:
+#        GOOGLE_SERVICE_ACCOUNT_JSON = <the full JSON key, as one line>
+#        GOOGLE_CALENDAR_ID = <your calendar's email/ID, usually your Gmail>
+#        MEETING_TIMEZONE = e.g. "Asia/Kolkata" (defaults to that if unset)
+# If these aren't set, or the client's preferred_time can't be parsed
+# into a real date/time, this silently falls back to local-log-only --
+# it never crashes the call.
+#
+# IMPORTANT: this makes booking real WHEN the tool successfully fires.
+# It does NOT fix the separate, already-diagnosed Agora-side issue
+# where book_meeting sometimes never gets called when chained right
+# after another tool in the same turn -- that's a platform-level
+# dispatch issue upstream of this code, unrelated to whether the
+# calendar write itself is real or simulated.
+# ---------------------------------------------------------------------
+
+GOOGLE_SERVICE_ACCOUNT_JSON = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON", "")
+GOOGLE_CALENDAR_ID = os.environ.get("GOOGLE_CALENDAR_ID", "")
+MEETING_TIMEZONE = os.environ.get("MEETING_TIMEZONE", "Asia/Kolkata")
+MEETING_DURATION_MINUTES = 30
+
+_calendar_service = None
+
+
+def _get_calendar_service():
+    global _calendar_service
+    if _calendar_service is not None:
+        return _calendar_service
+    if not GOOGLE_SERVICE_ACCOUNT_JSON or not GOOGLE_CALENDAR_ID:
+        return None
+    try:
+        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/calendar"]
+        )
+        _calendar_service = google_build("calendar", "v3", credentials=creds, cache_discovery=False)
+        return _calendar_service
+    except Exception as e:
+        logger.error(f"[calendar] failed to initialize service: {e}")
+        return None
+
+
+def create_calendar_event(customer_name: str, preferred_time: str, meeting_type: str) -> dict:
+    """Creates a REAL Google Calendar event. Returns a status dict;
+    NEVER raises -- a parsing failure or API hiccup should never take
+    down the call, it just falls back to local-log-only for this
+    booking."""
+    if not GOOGLE_SERVICE_ACCOUNT_JSON or not GOOGLE_CALENDAR_ID:
+        return {"created": False, "detail": "calendar not configured (missing GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_CALENDAR_ID)"}
+
+    service = _get_calendar_service()
+    if service is None:
+        return {"created": False, "detail": "calendar service failed to initialize -- check service account JSON"}
+
+    parsed_start = dateparser.parse(
+        preferred_time,
+        settings={"PREFER_DATES_FROM": "future", "TIMEZONE": MEETING_TIMEZONE, "RETURN_AS_TIMEZONE_AWARE": True},
+    )
+    if parsed_start is None:
+        return {"created": False, "detail": f"could not parse a real date/time from '{preferred_time}'"}
+
+    parsed_end = parsed_start + timedelta(minutes=MEETING_DURATION_MINUTES)
+
+    event_body = {
+        "summary": f"{meeting_type} -- {customer_name}",
+        "description": f"Booked via Close (voice agent) for {customer_name}.",
+        "start": {"dateTime": parsed_start.isoformat(), "timeZone": MEETING_TIMEZONE},
+        "end": {"dateTime": parsed_end.isoformat(), "timeZone": MEETING_TIMEZONE},
+    }
+
+    try:
+        created_event = service.events().insert(calendarId=GOOGLE_CALENDAR_ID, body=event_body).execute()
+        return {
+            "created": True,
+            "detail": "calendar event created",
+            "event_link": created_event.get("htmlLink", ""),
+            "parsed_start": parsed_start.isoformat(),
+        }
+    except Exception as e:
+        return {"created": False, "detail": f"calendar API call failed: {e}"}
 
 
 @app.exception_handler(RequestValidationError)
@@ -323,11 +437,15 @@ class BookMeetingRequest(BaseModel):
 async def book_meeting(req: BookMeetingRequest):
     """Agora Custom Tool: book a meeting with the Talentbridge Consulting
     recruitment team once the client is ready to move forward."""
+    meeting_type = req.meeting_type or "recruitment team demo"
+    calendar_result = create_calendar_event(req.customer_name, req.preferred_time, meeting_type)
+
     record = {
         "status": "booked",
         "customer_name": req.customer_name,
         "time": req.preferred_time,
-        "meeting_type": req.meeting_type or "recruitment team demo",
+        "meeting_type": meeting_type,
+        "calendar": calendar_result,
         "logged_at": time.time(),
     }
     append_jsonl(CALENDAR_LOG_PATH, record)
@@ -350,15 +468,18 @@ async def create_lead(req: CreateLeadRequest):
     """Agora Custom Tool: create or update a lead/CRM record with the
     client's current requirements. Call this once real qualification
     details are known, and again if requirements materially change."""
+    email_result = send_lead_email(req.customer_name, req.email or "", req.requirements_summary or "")
+
     record = {
         "status": "lead_logged",
         "customer_name": req.customer_name,
         "email": req.email or "",
         "requirements_summary": req.requirements_summary or "",
+        "notification_email": email_result,
         "logged_at": time.time(),
     }
     append_jsonl(CRM_LOG_PATH, record)
-    log_tool_call("create_lead", req.model_dump(), record)
+    log_tool_call("create_lead", req.model_dump(), {**record, "notification_email": email_result})
     return record
 
 
