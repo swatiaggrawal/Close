@@ -261,3 +261,46 @@ def test_calls_get_logged_and_are_readable():
     logs = r.json()["logs"]
     assert len(logs) == 1
     assert logs[-1]["tool"] == "get_staffing_quote"
+
+
+# ---------------------------------------------------------------------
+# dashboard / stats
+# ---------------------------------------------------------------------
+
+def test_dashboard_stats_returns_expected_shape():
+    r = client.get("/dashboard/stats")
+    assert r.status_code == 200
+    data = r.json()
+    assert set(data["counts"].keys()) == {"quotes_given", "leads_captured", "meetings_booked", "escalations"}
+
+
+def test_dashboard_stats_counts_increase_after_activity():
+    before = client.get("/dashboard/stats").json()["counts"]["leads_captured"]
+    client.post("/tools/create_lead", json={"customer_name": "Dashboard Test", "email": "dash@example.com"})
+    after = client.get("/dashboard/stats").json()["counts"]["leads_captured"]
+    assert after == before + 1
+
+
+def test_dashboard_page_loads():
+    r = client.get("/dashboard")
+    assert r.status_code == 200
+    assert "Close" in r.text
+    assert "text/html" in r.headers["content-type"]
+
+
+# ---------------------------------------------------------------------
+# client confirmation emails
+# ---------------------------------------------------------------------
+
+def test_book_meeting_skips_confirmation_without_valid_email():
+    r = client.post("/tools/book_meeting", json={"customer_name": "Ananya Rao", "preferred_time": "Thursday 3pm"})
+    data = r.json()
+    assert data["client_confirmation"]["sent"] is False
+
+
+def test_looks_like_email_helper():
+    from main import _looks_like_email
+    assert _looks_like_email("swati@example.com") is True
+    assert _looks_like_email("711-930-926") is False
+    assert _looks_like_email("Not provided") is False
+    assert _looks_like_email("") is False

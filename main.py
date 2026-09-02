@@ -91,12 +91,23 @@ ESCALATION_EMAIL_TO = os.environ.get("ESCALATION_EMAIL_TO", "")
 ESCALATION_EMAIL_FROM = os.environ.get("ESCALATION_EMAIL_FROM", "onboarding@resend.dev")
 
 
-def send_notification_email(subject: str, body_text: str) -> dict:
-    """Sends a real email via Resend. Returns a status dict; NEVER
-    raises -- a flaky email API should never take down the call.
-    Shared by escalation and lead-capture notifications."""
-    if not RESEND_API_KEY or not ESCALATION_EMAIL_TO:
-        return {"sent": False, "detail": "email not configured (missing RESEND_API_KEY or ESCALATION_EMAIL_TO)"}
+def _looks_like_email(value: str) -> bool:
+    """Cheap heuristic gate before attempting to send -- not full RFC
+    validation, just enough to avoid wasting an API call on a phone
+    number or 'not provided'."""
+    if not value:
+        return False
+    v = value.strip()
+    return "@" in v and "." in v.split("@")[-1] and " " not in v
+
+
+def send_notification_email(subject: str, body_text: str, to_address: str) -> dict:
+    """Sends a real email via Resend to a given address. Returns a
+    status dict; NEVER raises -- a flaky email API should never take
+    down the call. Used for BOTH internal team notifications and
+    client-facing confirmations, just with a different to_address."""
+    if not RESEND_API_KEY or not to_address:
+        return {"sent": False, "detail": "email not configured or no recipient address available"}
 
     try:
         resp = requests.post(
@@ -104,7 +115,7 @@ def send_notification_email(subject: str, body_text: str) -> dict:
             headers={"Authorization": f"Bearer {RESEND_API_KEY}", "Content-Type": "application/json"},
             json={
                 "from": f"Close (Talentbridge Consulting) <{ESCALATION_EMAIL_FROM}>",
-                "to": [ESCALATION_EMAIL_TO],
+                "to": [to_address],
                 "subject": subject,
                 "text": body_text,
             },
@@ -126,7 +137,7 @@ def send_escalation_email(reason: str, conversation_summary: str, customer_name:
         f"Reason: {reason}\n\n"
         f"Conversation summary:\n{conversation_summary}\n"
     )
-    return send_notification_email(subject, body)
+    return send_notification_email(subject, body, ESCALATION_EMAIL_TO)
 
 
 def send_lead_email(customer_name: str, email: str, requirements_summary: str) -> dict:
@@ -137,7 +148,18 @@ def send_lead_email(customer_name: str, email: str, requirements_summary: str) -
         f"Client email: {email or 'Not provided'}\n\n"
         f"Requirements:\n{requirements_summary or 'Not yet specified'}\n"
     )
-    return send_notification_email(subject, body)
+    return send_notification_email(subject, body, ESCALATION_EMAIL_TO)
+
+
+def send_client_confirmation(to_address: str, subject: str, body_text: str) -> dict:
+    """Client-facing confirmation -- this is the 'follow-up creation'
+    outcome from the problem statement, made real rather than just
+    logged. Only attempts to send if to_address looks like a real
+    email; otherwise returns a clear 'skipped' status without wasting
+    an API call or treating it as an error."""
+    if not _looks_like_email(to_address):
+        return {"sent": False, "detail": "skipped -- no valid client email available"}
+    return send_notification_email(subject, body_text, to_address)
 
 
 # ---------------------------------------------------------------------
@@ -230,6 +252,70 @@ def create_calendar_event(customer_name: str, preferred_time: str, meeting_type:
         }
     except Exception as e:
         return {"created": False, "detail": f"calendar API call failed: {e}"}
+
+
+# ---------------------------------------------------------------------
+# Real CRM view (Google Sheets). Uses the SAME service account as
+# Calendar above -- no new auth setup needed, just one more scope and
+# one more thing shared with that service account.
+#
+# Setup (~10 min, reuses the service account from Calendar setup):
+#   1. Create a Google Sheet, add a header row to a tab named "Leads":
+#      Timestamp | Customer Name | Email | Requirements Summary
+#   2. Share that Sheet with the SAME service account email you used
+#      for Calendar (Editor access).
+#   3. Set env vars on Render:
+#        GOOGLE_SHEETS_ID = the spreadsheet ID (the long string in its URL)
+#        GOOGLE_SHEETS_RANGE = "Leads!A:D" (default if unset)
+# If unconfigured, create_lead still works exactly as before -- it
+# just skips the Sheets write silently.
+# ---------------------------------------------------------------------
+
+GOOGLE_SHEETS_ID = os.environ.get("GOOGLE_SHEETS_ID", "")
+GOOGLE_SHEETS_RANGE = os.environ.get("GOOGLE_SHEETS_RANGE", "Leads!A:D")
+
+_sheets_service = None
+
+
+def _get_sheets_service():
+    global _sheets_service
+    if _sheets_service is not None:
+        return _sheets_service
+    if not GOOGLE_SERVICE_ACCOUNT_JSON or not GOOGLE_SHEETS_ID:
+        return None
+    try:
+        info = json.loads(GOOGLE_SERVICE_ACCOUNT_JSON)
+        creds = service_account.Credentials.from_service_account_info(
+            info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        )
+        _sheets_service = google_build("sheets", "v4", credentials=creds, cache_discovery=False)
+        return _sheets_service
+    except Exception as e:
+        logger.error(f"[sheets] failed to initialize service: {e}")
+        return None
+
+
+def append_lead_to_sheet(customer_name: str, email: str, requirements_summary: str) -> dict:
+    """Appends a real row to a Google Sheet acting as a lightweight,
+    genuinely live CRM view. Returns a status dict; NEVER raises."""
+    if not GOOGLE_SERVICE_ACCOUNT_JSON or not GOOGLE_SHEETS_ID:
+        return {"appended": False, "detail": "sheets not configured (missing GOOGLE_SERVICE_ACCOUNT_JSON or GOOGLE_SHEETS_ID)"}
+
+    service = _get_sheets_service()
+    if service is None:
+        return {"appended": False, "detail": "sheets service failed to initialize -- check service account JSON"}
+
+    row = [time.strftime("%Y-%m-%d %H:%M:%S"), customer_name, email or "", requirements_summary or ""]
+    try:
+        service.spreadsheets().values().append(
+            spreadsheetId=GOOGLE_SHEETS_ID,
+            range=GOOGLE_SHEETS_RANGE,
+            valueInputOption="USER_ENTERED",
+            body={"values": [row]},
+        ).execute()
+        return {"appended": True, "detail": "row added to Google Sheet"}
+    except Exception as e:
+        return {"appended": False, "detail": f"sheets API call failed: {e}"}
 
 
 @app.exception_handler(RequestValidationError)
@@ -431,14 +517,29 @@ class BookMeetingRequest(BaseModel):
     customer_name: str
     preferred_time: str
     meeting_type: Optional[str] = "recruitment team demo"
+    customer_email: Optional[str] = ""
 
 
 @app.post("/tools/book_meeting")
 async def book_meeting(req: BookMeetingRequest):
     """Agora Custom Tool: book a meeting with the Talentbridge Consulting
-    recruitment team once the client is ready to move forward."""
+    recruitment team once the client is ready to move forward. Ask for
+    the client's email too if you don't have it, so we can send them a
+    confirmation."""
     meeting_type = req.meeting_type or "recruitment team demo"
     calendar_result = create_calendar_event(req.customer_name, req.preferred_time, meeting_type)
+
+    confirmation_result = send_client_confirmation(
+        req.customer_email,
+        f"Your meeting with Talentbridge Consulting is confirmed",
+        (
+            f"Hi {req.customer_name},\n\n"
+            f"This confirms your {meeting_type} with our recruitment team, "
+            f"requested for: {req.preferred_time}.\n\n"
+            f"We look forward to speaking with you.\n\n"
+            f"-- Talentbridge Consulting"
+        ),
+    )
 
     record = {
         "status": "booked",
@@ -446,6 +547,7 @@ async def book_meeting(req: BookMeetingRequest):
         "time": req.preferred_time,
         "meeting_type": meeting_type,
         "calendar": calendar_result,
+        "client_confirmation": confirmation_result,
         "logged_at": time.time(),
     }
     append_jsonl(CALENDAR_LOG_PATH, record)
@@ -454,7 +556,7 @@ async def book_meeting(req: BookMeetingRequest):
 
 
 # ---------------------------------------------------------------------
-# Tool 4: Create lead -- logged locally (simulated CRM)
+# Tool 4: Create lead -- real CRM row (Google Sheets) + real emails
 # ---------------------------------------------------------------------
 
 class CreateLeadRequest(BaseModel):
@@ -468,23 +570,37 @@ async def create_lead(req: CreateLeadRequest):
     """Agora Custom Tool: create or update a lead/CRM record with the
     client's current requirements. Call this once real qualification
     details are known, and again if requirements materially change."""
-    email_result = send_lead_email(req.customer_name, req.email or "", req.requirements_summary or "")
+    internal_email_result = send_lead_email(req.customer_name, req.email or "", req.requirements_summary or "")
+    sheet_result = append_lead_to_sheet(req.customer_name, req.email or "", req.requirements_summary or "")
+    confirmation_result = send_client_confirmation(
+        req.email,
+        "Thanks for reaching out to Talentbridge Consulting",
+        (
+            f"Hi {req.customer_name},\n\n"
+            f"Thanks for the conversation today. Here's what we've noted so far:\n\n"
+            f"{req.requirements_summary or 'We will follow up to confirm your requirements.'}\n\n"
+            f"Our recruitment team will follow up with you shortly.\n\n"
+            f"-- Talentbridge Consulting"
+        ),
+    )
 
     record = {
         "status": "lead_logged",
         "customer_name": req.customer_name,
         "email": req.email or "",
         "requirements_summary": req.requirements_summary or "",
-        "notification_email": email_result,
+        "notification_email": internal_email_result,
+        "sheet": sheet_result,
+        "client_confirmation": confirmation_result,
         "logged_at": time.time(),
     }
     append_jsonl(CRM_LOG_PATH, record)
-    log_tool_call("create_lead", req.model_dump(), {**record, "notification_email": email_result})
+    log_tool_call("create_lead", req.model_dump(), record)
     return record
 
 
 # ---------------------------------------------------------------------
-# Tool 5: Escalate to human -- logged locally (simulated handoff)
+# Tool 5: Escalate to human -- real email handoff + client confirmation
 # ---------------------------------------------------------------------
 
 class EscalateRequest(BaseModel):
@@ -507,6 +623,16 @@ async def escalate_to_human(req: EscalateRequest):
     email_result = send_escalation_email(
         req.reason, req.conversation_summary, req.customer_name, req.contact_info
     )
+    confirmation_result = send_client_confirmation(
+        req.contact_info,
+        "We've received your request -- Talentbridge Consulting",
+        (
+            f"Hi {req.customer_name},\n\n"
+            f"A recruitment specialist has the full context of your conversation "
+            f"and will follow up with you shortly regarding: {req.reason}.\n\n"
+            f"-- Talentbridge Consulting"
+        ),
+    )
 
     record = {
         "status": "escalated",
@@ -515,6 +641,7 @@ async def escalate_to_human(req: EscalateRequest):
         "customer_name": req.customer_name,
         "contact_info": req.contact_info,
         "email": email_result,
+        "client_confirmation": confirmation_result,
         "logged_at": time.time(),
     }
     append_jsonl(ESCALATION_LOG_PATH, record)
@@ -522,7 +649,7 @@ async def escalate_to_human(req: EscalateRequest):
         "status": "escalated",
         "message": "A recruitment specialist has the full context and will join or follow up shortly.",
     }
-    log_tool_call("escalate_to_human", req.model_dump(), {**response, "email": email_result})
+    log_tool_call("escalate_to_human", req.model_dump(), {**response, "email": email_result, "client_confirmation": confirmation_result})
     return response
 
 
@@ -563,3 +690,106 @@ async def get_error_logs(limit: int = 20):
         return {"errors": []}
     lines = ERROR_LOG_PATH.read_text().strip().splitlines()
     return {"errors": [json.loads(l) for l in lines[-limit:]] if lines else []}
+
+
+def _read_jsonl(path: Path, limit: int) -> list:
+    if not path.exists():
+        return []
+    lines = path.read_text().strip().splitlines()
+    return [json.loads(l) for l in lines[-limit:]] if lines else []
+
+
+@app.get("/dashboard/stats")
+async def dashboard_stats():
+    """Aggregated counts + recent activity across all tools. Pure
+    read-only, works regardless of whether Calendar/Sheets/email are
+    configured -- always reflects the local JSONL logs, which are the
+    one source of truth every tool writes to no matter what."""
+    quotes = _read_jsonl(CALL_LOG_PATH, 500)
+    quote_calls = [q for q in quotes if q.get("tool") == "get_staffing_quote"]
+    leads = _read_jsonl(CRM_LOG_PATH, 500)
+    bookings = _read_jsonl(CALENDAR_LOG_PATH, 500)
+    escalations = _read_jsonl(ESCALATION_LOG_PATH, 500)
+
+    return {
+        "counts": {
+            "quotes_given": len(quote_calls),
+            "leads_captured": len(leads),
+            "meetings_booked": len(bookings),
+            "escalations": len(escalations),
+        },
+        "recent_leads": leads[-5:],
+        "recent_bookings": bookings[-5:],
+        "recent_escalations": escalations[-5:],
+    }
+
+
+@app.get("/dashboard")
+async def dashboard_page():
+    """A tiny live ops dashboard -- auto-refreshing, no build step, no
+    auth. Not a replacement for a real product UI, but gives the
+    recruitment team (and your demo video) something to actually look
+    at instead of raw JSON."""
+    from fastapi.responses import HTMLResponse
+    html = """
+<!DOCTYPE html>
+<html>
+<head>
+<title>Close -- Talentbridge Consulting Ops Dashboard</title>
+<meta charset="utf-8">
+<style>
+  body { font-family: -apple-system, sans-serif; background: #0b0b0d; color: #eee; margin: 0; padding: 32px; }
+  h1 { font-size: 22px; margin-bottom: 4px; }
+  .sub { color: #888; margin-bottom: 28px; font-size: 13px; }
+  .cards { display: flex; gap: 16px; margin-bottom: 32px; flex-wrap: wrap; }
+  .card { background: #17161a; border-radius: 10px; padding: 18px 24px; min-width: 140px; }
+  .card .num { font-size: 32px; font-weight: 700; color: #e5b45c; }
+  .card .label { font-size: 12px; color: #aaa; margin-top: 4px; }
+  .section { margin-bottom: 28px; }
+  .section h2 { font-size: 15px; color: #e5b45c; margin-bottom: 10px; }
+  .row { background: #121114; border-radius: 8px; padding: 10px 14px; margin-bottom: 6px; font-size: 13px; }
+  .row .name { font-weight: 600; }
+  .row .meta { color: #999; font-size: 12px; }
+  .empty { color: #666; font-size: 13px; font-style: italic; }
+</style>
+</head>
+<body>
+  <h1>Close -- Live Ops Dashboard</h1>
+  <div class="sub">Talentbridge Consulting &middot; auto-refreshes every 5s</div>
+  <div class="cards" id="cards"></div>
+  <div class="section"><h2>Recent Leads</h2><div id="leads"></div></div>
+  <div class="section"><h2>Recent Bookings</h2><div id="bookings"></div></div>
+  <div class="section"><h2>Recent Escalations</h2><div id="escalations"></div></div>
+
+<script>
+async function refresh() {
+  const r = await fetch('/dashboard/stats');
+  const data = await r.json();
+
+  document.getElementById('cards').innerHTML = `
+    <div class="card"><div class="num">${data.counts.quotes_given}</div><div class="label">Quotes Given</div></div>
+    <div class="card"><div class="num">${data.counts.leads_captured}</div><div class="label">Leads Captured</div></div>
+    <div class="card"><div class="num">${data.counts.meetings_booked}</div><div class="label">Meetings Booked</div></div>
+    <div class="card"><div class="num">${data.counts.escalations}</div><div class="label">Escalations</div></div>
+  `;
+
+  const renderRows = (items, fields) => {
+    if (!items.length) return '<div class="empty">Nothing yet.</div>';
+    return items.slice().reverse().map(item => {
+      const primary = fields.primary.map(f => item[f]).filter(Boolean).join(' -- ');
+      const meta = fields.meta.map(f => item[f]).filter(Boolean).join(' | ');
+      return `<div class="row"><div class="name">${primary}</div><div class="meta">${meta}</div></div>`;
+    }).join('');
+  };
+
+  document.getElementById('leads').innerHTML = renderRows(data.recent_leads, {primary: ['customer_name'], meta: ['email', 'requirements_summary']});
+  document.getElementById('bookings').innerHTML = renderRows(data.recent_bookings, {primary: ['customer_name'], meta: ['time', 'meeting_type']});
+  document.getElementById('escalations').innerHTML = renderRows(data.recent_escalations, {primary: ['customer_name'], meta: ['reason']});
+}
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>
+"""
+    return HTMLResponse(content=html)
