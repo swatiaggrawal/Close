@@ -192,6 +192,41 @@ def test_create_lead_without_email_config_does_not_crash():
     assert data["notification_email"]["sent"] is False  # expected: not configured in test env
 
 
+def test_create_lead_without_meeting_time_skips_calendar():
+    """If no preferred_meeting_time is given, this must NOT attempt a
+    calendar booking at all -- calendar should be None, not an error."""
+    r = client.post("/tools/create_lead", json={"customer_name": "Ananya Rao", "email": "a@example.com"})
+    assert r.json()["calendar"] is None
+
+
+def test_create_lead_with_meeting_time_attempts_calendar():
+    """This is the consolidated replacement for the old standalone
+    book_meeting flow -- a meeting request now travels through the
+    reliable create_lead tool instead of a separate, less reliable
+    one. Calendar isn't configured in test env, so this checks it was
+    ATTEMPTED (calendar dict present, created=False), not that it
+    succeeded."""
+    r = client.post("/tools/create_lead", json={
+        "customer_name": "Ananya Rao", "email": "a@example.com", "preferred_meeting_time": "Thursday 3pm",
+    })
+    data = r.json()
+    assert data["calendar"] is not None
+    assert data["calendar"]["created"] is False  # not configured in test env, but attempted
+    assert data["preferred_meeting_time"] == "Thursday 3pm"
+
+
+def test_create_lead_sheet_row_includes_meeting_time():
+    """Sheets row (5 columns now) should include the meeting time when
+    given -- checked indirectly since we can't hit real Sheets in
+    tests, but the function must accept and pass it through without
+    crashing."""
+    r = client.post("/tools/create_lead", json={
+        "customer_name": "Ananya Rao", "requirements_summary": "20 IT hires", "preferred_meeting_time": "Friday 11am",
+    })
+    assert r.status_code == 200
+    assert r.json()["sheet"]["appended"] is False  # not configured in test env, but didn't crash
+
+
 # ---------------------------------------------------------------------
 # escalate_to_human
 # ---------------------------------------------------------------------
@@ -208,7 +243,23 @@ def test_escalate_basic():
     assert "specialist" in data["message"].lower()
 
 
-def test_escalate_defaults_when_contact_details_missing():
+def test_escalate_with_combined_contact_info_still_sends_confirmation():
+    """End-to-end reproduction of the real bug: contact_info holds both
+    email and phone together. Before the fix, client_confirmation was
+    skipped with 'doesn't look like a valid email'; now it must find
+    the email and attempt to send (checked via /logs/calls, same way
+    the real bug was diagnosed live)."""
+    client.post("/tools/escalate_to_human", json={
+        "reason": "client requested a human",
+        "conversation_summary": "test",
+        "customer_name": "Swati",
+        "contact_info": "swatiagg357@gmail.com, 011930927",
+    })
+    r2 = client.get("/logs/calls?limit=1")
+    last_result = r2.json()["logs"][-1]["result"]
+    detail = last_result["client_confirmation"]["detail"].lower()
+    assert "no email found" not in detail
+    assert "doesn't look like a valid email" not in detail
     """If the LLM escalates without capturing name/contact (shouldn't
     happen per the tool description, but must not crash if it does),
     these should default to a clear 'Not provided' rather than blank
@@ -247,12 +298,13 @@ def test_escalate_requires_summary():
 # health + logging
 # ---------------------------------------------------------------------
 
-def test_health_lists_all_five_tools():
+def test_health_lists_four_active_tools():
     r = client.get("/health")
-    tools = r.json()["tools"]
-    assert set(tools) == {
-        "get_staffing_quote", "search_service_info", "book_meeting", "create_lead", "escalate_to_human",
+    data = r.json()
+    assert set(data["active_tools"]) == {
+        "get_staffing_quote", "search_service_info", "create_lead", "escalate_to_human",
     }
+    assert "book_meeting" in data["deprecated_endpoints_still_present"]
 
 
 def test_calls_get_logged_and_are_readable():
@@ -327,3 +379,16 @@ def test_looks_like_email_catches_asr_mistranscription():
     assert _looks_like_email(normalize_email(" Swati AGG357 @ Gmail.com ".replace(" ", ""))) is True
     # a genuinely malformed address (no domain) is still correctly rejected
     assert _looks_like_email(normalize_email("swati at gmail")) is False
+
+
+def test_extract_email_from_combined_email_and_phone():
+    """Real bug found in live testing: escalate_to_human's contact_info
+    legitimately captured BOTH email and phone together
+    ('swati@gmail.com, 011930927') -- confirmation must still find and
+    use the email, not skip just because the field isn't PURELY an
+    email."""
+    from main import extract_email
+    assert extract_email("swatiagg357@gmail.com, 011930927") == "swatiagg357@gmail.com"
+    assert extract_email("011930927") == ""
+    assert extract_email("Not provided") == ""
+    assert extract_email("call me at 555-1234 or SWATI@GMAIL.COM") == "swati@gmail.com"

@@ -1,172 +1,104 @@
-# Close -- Agora-Native Backend (Talentbridge Consulting recruitment demo)
+# Close -- Voice Sales Agent for Talentbridge Consulting
 
-Architecture: Agora's own managed LLM (`gpt-4o-mini`) handles all
-conversation reasoning, memory, turn-taking, and interruption handling
-natively. This service ONLY exposes plain REST endpoints that Agora
-calls directly via **Custom Tools** (Actions tab). No LLM adapter, no
-LangChain, no Gemini in this version -- that path was tried, worked,
-but added a ~12s latency hit from a second LLM hop and was dropped in
-favor of this simpler, faster, Agora-native approach.
+A real-time voice AI sales and qualification agent built on Agora's Conversational AI Engine, for a staffing/recruitment consultancy demo scenario. Agora's own managed LLM (`gpt-4o-mini`) handles all conversation reasoning, memory, turn-taking, and interruption handling natively -- this repo only exposes plain REST endpoints that Agora calls directly via **Custom Tools**.
 
-## What's real vs. simulated (say this plainly in your demo/video)
+## Architecture decision history (worth reading, not just the current state)
+
+Two real pivots happened during development, both documented here rather than hidden, because the reasoning behind them is part of the engineering story:
+
+1. **Custom LLM adapter (Gemini via LangChain) -> Agora-native tool-calling.** We initially built a FastAPI adapter exposing an OpenAI-compatible endpoint in front of Gemini, to get real tool-calling since Agora's native Gemini config didn't expose function-calling. It worked, but added a second LLM hop (~12s latency per turn) on top of Agora's own reasoning -- too slow for real-time voice. Switched to Agora's native Custom Tools calling this service directly, no adapter, no double LLM hop.
+
+2. **Standalone `book_meeting` tool -> merged into `create_lead`.** We built and tested a dedicated booking tool with real Google Calendar integration. It worked reliably when tested in isolation via direct HTTP calls to this backend, but showed a platform-level dispatch issue through Agora -- the LLM would narrate "let me try that again" but the tool call sometimes never reached this service at all (confirmed via server-side logs showing zero incoming requests during failures, despite direct curl calls to the same endpoint always succeeding). Rather than ship an unreliable "star" feature, we consolidated meeting requests into `create_lead` -- the most reliable tool in the whole system -- as an optional field. A meeting request now travels through the same dependable path as lead capture, and still creates a real Calendar event when a time is provided. `book_meeting`'s code is kept in this repo for reference but is no longer registered as an active Agora Custom Tool.
+
+## What's real vs. simulated (say this plainly in the demo video)
 
 **Real:**
 - Voice pipeline, conversation reasoning, memory, turn-taking, interruption handling -- all Agora-native (`gpt-4o-mini`)
-- Pricing calculation -- real tiered/volume-discount logic in `get_staffing_quote`
-- Service info retrieval -- real keyword-scored search over a small in-memory corpus (`search_service_info`)
-- Full tool-call logging to disk for every request
+- Pricing calculation -- real tiered/volume-discount logic across 5 service categories (finance, IT, executive, marketing, media)
+- Service info retrieval -- keyword-scored search over a small in-memory corpus (see "RAG" note below)
+- **Google Calendar booking** -- real events created via a Google Calendar API service account, triggered through `create_lead`'s optional `preferred_meeting_time` field
+- **Google Sheets CRM** -- real rows appended to a live spreadsheet on every lead capture
+- **Real email notifications** -- both internal (to the recruitment team) and client-facing confirmations, sent via Resend, for lead capture and escalation
+- Full tool-call and error logging to disk, plus a live `/dashboard` view
 
-**Simulated for this round:**
-- CRM (`create_lead`) and calendar (`book_meeting`) write to local JSONL logs, not a real CRM/calendar product
-- Human escalation (`escalate_to_human`) logs a structured handoff payload, doesn't ring an actual person
+**Simulated / not fully solved:**
+- The standalone `book_meeting` endpoint code still exists and works correctly in isolation, but is not currently wired to Agora due to the platform reliability issue described above
+- Client email/phone capture depends on ASR accuracy for spelled-out strings -- mitigated with a confirm-before-proceeding step in the prompt and server-side normalization/validation, but not fully solvable (a mistranscribed word that happens to look like a valid email locally can't be caught by validation alone)
 
-This is an honest scope choice for a hackathon demo, not something to hide.
+**On "RAG":** `search_service_info` uses keyword-overlap scoring, not embeddings-based retrieval. It correctly grounds answers in real documents rather than letting the model invent facts, which is the functional goal -- but it's precise to call it "retrieval-based," not full RAG, if asked to elaborate on the technique.
 
----
+## Active tools (4)
 
-## Step 1: Install and run locally
+| Tool | What it does | Real integrations |
+|---|---|---|
+| `get_staffing_quote` | Tiered pricing with volume discounts | Pure computation, always reliable |
+| `search_service_info` | Answers service/guarantee/competitor questions | Keyword-scored retrieval over 7 docs |
+| `create_lead` | Captures lead info, **and optionally books a meeting** if `preferred_meeting_time` is given | Google Sheets row, Google Calendar event, internal + client emails |
+| `escalate_to_human` | Hands off to a human with full context, once per call | Internal email with conversation summary, client confirmation email |
+
+## Setup
 
 ```bash
 pip install -r requirements.txt --break-system-packages
+```
+
+### Required
+```bash
 uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-Confirm it's up:
-```bash
-curl http://localhost:8000/health
-```
-Expected: `{"status":"ok","tools":["get_staffing_quote","search_service_info","book_meeting","create_lead","escalate_to_human"]}`
+### Real email (Resend) -- internal + client confirmations
+1. Sign up free at resend.com, copy your API key
+2. Set env vars: `RESEND_API_KEY`, `ESCALATION_EMAIL_TO` (your team inbox)
+3. Sandbox mode only sends to the address you signed up with -- fine for demo purposes
 
-## Step 2: Run the automated tool tests
+### Real Calendar + Sheets (Google, shared service account)
+1. Google Cloud Console -> enable **Google Calendar API** and **Google Sheets API**
+2. IAM & Admin -> Service Accounts -> create one -> download its JSON key
+3. Share your Google Calendar with that service account's email, "Make changes to events" permission
+4. Create a Google Sheet with a tab named `Leads`, header row: `Timestamp | Customer Name | Email | Requirements Summary | Preferred Meeting Time`. Share it with the same service account, Editor access
+5. Set env vars: `GOOGLE_SERVICE_ACCOUNT_JSON` (full JSON as one line), `GOOGLE_CALENDAR_ID` (your calendar email), `GOOGLE_SHEETS_ID` (from the sheet's URL), optionally `MEETING_TIMEZONE` (defaults to `Asia/Kolkata`)
 
+All of the above degrade gracefully if unconfigured -- every tool still works, it just skips the real-world side effect and logs why.
+
+## Agora Console setup
+
+Register these Custom Tools (Actions tab), each with matching Body template and Parameters JSON -- see inline docstrings in `main.py` for the exact field names each endpoint expects. Attach all 4 active tools to your agent, set LLM vendor to OpenAI / `gpt-4o-mini` / Agora Managed Key, and paste the system prompt (kept in your submission notes) which governs:
+- Tracking changing requirements without falling back to stale numbers
+- Forcing `search_service_info` calls for competitor/guarantee questions rather than answering from general knowledge
+- Capturing name + email before a call ends
+- Reading back and confirming spoken emails/phone numbers before use
+- Escalating exactly once per call, only after contact details are confirmed
+
+**Important:** confirm `turn_detection` / Start of Speech / interrupt settings are enabled in the agent's Advanced config -- this is what makes interruption handling actually work, and it's a separate screen from the Custom Tools setup.
+
+## Testing
+
+### Automated (tool correctness -- 38 tests)
 ```bash
 pytest test_tools.py -v
 ```
-Should show 19 passed. These test pricing math, discount tiers, retrieval scoring, and logging -- NOT conversational behavior (see MANUAL_VOICE_TEST_SCRIPT.md for that).
+Covers pricing math, discount tiers, retrieval scoring, email normalization/extraction (including a real bug found in live testing: escalation's `contact_info` field can legitimately contain both an email and phone together), calendar/sheets graceful degradation, and dashboard stats.
 
-## Step 3: Expose it publicly
+**Scope note:** these test tool *logic*, not conversational *behavior* -- that reasoning lives in Agora's managed LLM, not this code, so it can't be unit tested this way.
 
-**For quick testing:** `ngrok http 8000` -- but you already hit a free-tier ngrok heartbeat timeout mid-session last time. Don't record your final demo over ngrok if you can avoid it.
+### Manual (conversational behavior)
+See `MANUAL_VOICE_TEST_SCRIPT.md` for the scripted checklist covering memory, interruption, objection handling, retrieval grounding, and the consolidated lead+meeting flow, run against the live agent through Agora.
 
-**For anything you actually demo/record:** deploy to Render's free tier instead. This is a lightweight REST service (no heavy embeddings, no memory-hungry vector DB), so it won't hit the memory cap issues you saw on Knowledge Copilot.
+## Live dashboard
 
-Quick Render deploy:
-1. Push this folder to a GitHub repo.
-2. On Render: New → Web Service → connect the repo.
-3. Build command: `pip install -r requirements.txt`
-4. Start command: `uvicorn main:app --host 0.0.0.0 --port $PORT`
-5. Deploy, copy the `https://your-app.onrender.com` URL.
+`GET /dashboard` -- an auto-refreshing ops view (quotes given, leads captured, meetings booked, escalations) reading directly from the same logs every tool writes to. No auth, no build step -- meant for demoing and quick sanity checks, not production use.
 
-## Step 4: Register the 5 Custom Tools in Agora Console
+## Known limitations, stated plainly
 
-Go to your agent config → **Actions tab** → **Custom Tools** → **Add Tool**, once for each:
+1. **Booking reliability was the reason for the architecture consolidation above** -- not fully solved, worked around by routing through the more reliable `create_lead` path instead.
+2. **ASR mistranscription of spelled-out contact details** is a fundamental voice-interface challenge, mitigated (confirm-before-use, server-side normalization) but not eliminated.
+3. **Retrieval is keyword-based, not embeddings-based** -- correctly grounds answers, but is a simpler technique than full RAG.
 
-### Tool 1: get_staffing_quote
-- **Endpoint:** `https://<your-url>/tools/get_staffing_quote`
-- **Method:** POST
-- **Description:** "Get a pricing quote for a staffing service. Call this whenever the client asks about cost or pricing."
-- **Parameters:**
-  ```json
-  {
-    "type": "object",
-    "properties": {
-      "service_type": { "type": "string", "description": "One of: finance, it, executive" },
-      "num_candidates": { "type": "integer", "description": "Number of candidates the client needs" }
-    },
-    "required": ["service_type", "num_candidates"]
-  }
-  ```
+## Files
 
-### Tool 2: search_service_info
-- **Endpoint:** `https://<your-url>/tools/search_service_info`
-- **Method:** POST
-- **Description:** "Search Talentbridge Consulting's service info, guarantees, timelines, and competitor comparisons. Call this for any factual question you're not certain about instead of guessing."
-- **Parameters:**
-  ```json
-  {
-    "type": "object",
-    "properties": {
-      "query": { "type": "string", "description": "The client's question, in their own words" }
-    },
-    "required": ["query"]
-  }
-  ```
-
-### Tool 3: book_meeting
-- **Endpoint:** `https://<your-url>/tools/book_meeting`
-- **Method:** POST
-- **Description:** "Book a meeting with the recruitment team once the client is ready to move forward. Call this when they agree to a next step and give a preferred time."
-- **Parameters:**
-  ```json
-  {
-    "type": "object",
-    "properties": {
-      "customer_name": { "type": "string" },
-      "preferred_time": { "type": "string", "description": "The client's stated preferred day/time" },
-      "meeting_type": { "type": "string", "description": "Optional, defaults to 'recruitment team demo'" }
-    },
-    "required": ["customer_name", "preferred_time"]
-  }
-  ```
-
-### Tool 4: create_lead
-- **Endpoint:** `https://<your-url>/tools/create_lead`
-- **Method:** POST
-- **Description:** "Log the client's contact info and current requirements once qualified. Call this when you know their name and at least one concrete requirement, and again if requirements materially change."
-- **Parameters:**
-  ```json
-  {
-    "type": "object",
-    "properties": {
-      "customer_name": { "type": "string" },
-      "email": { "type": "string", "description": "Optional" },
-      "requirements_summary": { "type": "string", "description": "Current, up-to-date summary of what the client needs -- always use the LATEST numbers if they changed mid-call" }
-    },
-    "required": ["customer_name"]
-  }
-  ```
-
-### Tool 5: escalate_to_human
-- **Endpoint:** `https://<your-url>/tools/escalate_to_human`
-- **Method:** POST
-- **Description:** "Hand off to a human recruitment specialist. Use when the client explicitly asks for a person, raises a legal/contract question, or the conversation has stalled after two attempts to resolve an objection."
-- **Parameters:**
-  ```json
-  {
-    "type": "object",
-    "properties": {
-      "reason": { "type": "string" },
-      "conversation_summary": { "type": "string", "description": "Summarize everything discussed so far so the human doesn't need the client to repeat themselves" }
-    },
-    "required": ["reason", "conversation_summary"]
-  }
-  ```
-
-After adding all 5, attach them to your agent, save, and **republish the agent config** -- changes don't take effect on a running agent until you do.
-
-## Step 5: Sanity-check the config
-
-- LLM vendor should be Agora-managed `gpt-4o-mini` (not a custom LLM URL -- you're not using the adapter path anymore).
-- `turn_detection.interrupt_mode` should be `"interrupt"` -- this is what makes interruption handling actually work. Check this explicitly, it's easy to leave on a default that doesn't interrupt.
-- `llm.max_history` controls how many turns of memory are kept (default 32) -- fine as-is for a demo-length call.
-
-## Step 6: Test it for real
-
-Work through **MANUAL_VOICE_TEST_SCRIPT.md** -- 8 scripted tests covering pricing, memory, interruption, objections, retrieval, escalation, and a full end-to-end booking flow. Record your screen while doing this; it's both your test evidence and usable demo footage.
-
-While testing, keep this open in another tab to confirm tools are actually firing, not just sounding plausible:
-```bash
-curl https://<your-url>/logs/calls?limit=10
-```
-
-## Files in this folder
-
-- `main.py` -- the 5 Custom Tools, plain FastAPI, no LLM calls
-- `test_tools.py` -- 19 automated tests for tool correctness (run with `pytest test_tools.py -v`)
-- `MANUAL_VOICE_TEST_SCRIPT.md` -- scripted checklist for testing conversational behavior live through Agora
+- `main.py` -- FastAPI backend, 4 active Custom Tools + 1 deprecated-but-present endpoint
+- `test_tools.py` -- 38 automated tests
+- `MANUAL_VOICE_TEST_SCRIPT.md` -- scripted conversational eval checklist
 - `requirements.txt`
-- `logs/` -- created automatically at runtime: `tool_calls.jsonl`, `crm_leads.jsonl`, `calendar_bookings.jsonl`, `escalations.jsonl`
-
-## What changed from the earlier Gemini/LangChain version
-
-That version is fully dropped from the active architecture. It's still worth mentioning in your submission as "explored, didn't use" -- it shows you evaluated the tradeoff (adapter flexibility vs. latency) and made a deliberate call, which is a stronger story than never having tried the alternative.
+- `logs/` -- created automatically: `tool_calls.jsonl`, `crm_leads.jsonl`, `calendar_bookings.jsonl`, `escalations.jsonl`, `request_errors.jsonl`

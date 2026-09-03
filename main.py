@@ -94,6 +94,24 @@ ESCALATION_EMAIL_FROM = os.environ.get("ESCALATION_EMAIL_FROM", "onboarding@rese
 import re
 
 _EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
+_EMAIL_SEARCH_RE = re.compile(r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}")
+
+
+def extract_email(text: str) -> str:
+    """Fields like escalate_to_human's contact_info are documented to
+    hold EITHER an email or phone -- but the model sometimes correctly
+    captures BOTH together (e.g. 'swati@gmail.com, 011930927'). A
+    whole-string email check fails on that even though a real email is
+    right there. This searches WITHIN the string instead of requiring
+    the whole field to be just an email. Deliberately does NOT strip
+    spaces before searching -- doing so previously caused unrelated
+    words either side of a real email to fuse into one false match
+    (e.g. 'call me at 555-1234 or swati@gmail.com' became one bad
+    local-part). Spaces are meaningful word boundaries here."""
+    if not text:
+        return ""
+    match = _EMAIL_SEARCH_RE.search(text.lower())
+    return match.group(0) if match else ""
 
 
 def normalize_email(value: str) -> str:
@@ -170,17 +188,15 @@ def send_lead_email(customer_name: str, email: str, requirements_summary: str) -
 def send_client_confirmation(to_address: str, subject: str, body_text: str) -> dict:
     """Client-facing confirmation -- this is the 'follow-up creation'
     outcome from the problem statement, made real rather than just
-    logged. Only attempts to send if to_address looks like a real
-    email; otherwise returns a clear 'skipped' status without wasting
-    an API call or treating it as an error. Normalizes (strips +
-    lowercases) before validating/sending -- ASR mistranscription of
-    spelled-out emails (e.g. a client saying 'capital S' while
-    spelling their name) is the most common cause of a technically-
-    wrong-case or stray-whitespace address reaching here."""
-    clean = normalize_email(to_address)
-    if not _looks_like_email(clean):
-        return {"sent": False, "detail": f"skipped -- '{to_address}' doesn't look like a valid email after cleanup"}
-    return send_notification_email(subject, body_text, clean)
+    logged. Extracts an email from anywhere in to_address (handles
+    fields like contact_info that may legitimately contain 'email,
+    phone' together) rather than requiring the whole field to be
+    purely an email. Skips cleanly if no email can be found -- never
+    an error, since a phone-only contact is a valid, expected case."""
+    found = extract_email(to_address)
+    if not found:
+        return {"sent": False, "detail": f"skipped -- no email found in '{to_address}'"}
+    return send_notification_email(subject, body_text, found)
 
 
 # ---------------------------------------------------------------------
@@ -282,18 +298,18 @@ def create_calendar_event(customer_name: str, preferred_time: str, meeting_type:
 #
 # Setup (~10 min, reuses the service account from Calendar setup):
 #   1. Create a Google Sheet, add a header row to a tab named "Leads":
-#      Timestamp | Customer Name | Email | Requirements Summary
+#      Timestamp | Customer Name | Email | Requirements Summary | Preferred Meeting Time
 #   2. Share that Sheet with the SAME service account email you used
 #      for Calendar (Editor access).
 #   3. Set env vars on Render:
 #        GOOGLE_SHEETS_ID = the spreadsheet ID (the long string in its URL)
-#        GOOGLE_SHEETS_RANGE = "Leads!A:D" (default if unset)
+#        GOOGLE_SHEETS_RANGE = "Leads!A:E" (default if unset)
 # If unconfigured, create_lead still works exactly as before -- it
 # just skips the Sheets write silently.
 # ---------------------------------------------------------------------
 
 GOOGLE_SHEETS_ID = os.environ.get("GOOGLE_SHEETS_ID", "")
-GOOGLE_SHEETS_RANGE = os.environ.get("GOOGLE_SHEETS_RANGE", "Leads!A:D")
+GOOGLE_SHEETS_RANGE = os.environ.get("GOOGLE_SHEETS_RANGE", "Leads!A:E")
 
 _sheets_service = None
 
@@ -316,7 +332,7 @@ def _get_sheets_service():
         return None
 
 
-def append_lead_to_sheet(customer_name: str, email: str, requirements_summary: str) -> dict:
+def append_lead_to_sheet(customer_name: str, email: str, requirements_summary: str, preferred_meeting_time: str = "") -> dict:
     """Appends a real row to a Google Sheet acting as a lightweight,
     genuinely live CRM view. Returns a status dict; NEVER raises."""
     if not GOOGLE_SERVICE_ACCOUNT_JSON or not GOOGLE_SHEETS_ID:
@@ -326,7 +342,7 @@ def append_lead_to_sheet(customer_name: str, email: str, requirements_summary: s
     if service is None:
         return {"appended": False, "detail": "sheets service failed to initialize -- check service account JSON"}
 
-    row = [time.strftime("%Y-%m-%d %H:%M:%S"), customer_name, email or "", requirements_summary or ""]
+    row = [time.strftime("%Y-%m-%d %H:%M:%S"), customer_name, email or "", requirements_summary or "", preferred_meeting_time or ""]
     try:
         service.spreadsheets().values().append(
             spreadsheetId=GOOGLE_SHEETS_ID,
@@ -577,32 +593,56 @@ async def book_meeting(req: BookMeetingRequest):
 
 
 # ---------------------------------------------------------------------
-# Tool 4: Create lead -- real CRM row (Google Sheets) + real emails
+# Tool 4: Create lead -- real CRM row (Google Sheets) + real emails +
+# optional meeting request (replaces the standalone booking tool)
 # ---------------------------------------------------------------------
 
 class CreateLeadRequest(BaseModel):
     customer_name: str
     email: Optional[str] = ""
     requirements_summary: Optional[str] = ""
+    preferred_meeting_time: Optional[str] = ""
 
 
 @app.post("/tools/create_lead")
 async def create_lead(req: CreateLeadRequest):
     """Agora Custom Tool: create or update a lead/CRM record with the
-    client's current requirements. Call this once real qualification
-    details are known, and again if requirements materially change."""
+    client's current requirements, and optionally request a meeting at
+    the same time. Call this once real qualification details are
+    known, and again if requirements materially change. If the client
+    wants to schedule a meeting, capture preferred_meeting_time here
+    too rather than needing a separate tool -- always ask for their
+    email before the call ends if you don't already have it, so a
+    lead record and any meeting request can actually reach them."""
     internal_email_result = send_lead_email(req.customer_name, req.email or "", req.requirements_summary or "")
-    sheet_result = append_lead_to_sheet(req.customer_name, req.email or "", req.requirements_summary or "")
-    confirmation_result = send_client_confirmation(
-        req.email,
-        "Thanks for reaching out to Talentbridge Consulting",
-        (
+    sheet_result = append_lead_to_sheet(
+        req.customer_name, req.email or "", req.requirements_summary or "", req.preferred_meeting_time or ""
+    )
+
+    calendar_result = None
+    if req.preferred_meeting_time:
+        calendar_result = create_calendar_event(req.customer_name, req.preferred_meeting_time, "recruitment team demo")
+
+    if req.preferred_meeting_time:
+        confirmation_body = (
+            f"Hi {req.customer_name},\n\n"
+            f"Thanks for the conversation today. Here's what we've noted so far:\n\n"
+            f"{req.requirements_summary or 'We will follow up to confirm your requirements.'}\n\n"
+            f"We've also noted your request to meet at: {req.preferred_meeting_time}. "
+            f"Our recruitment team will confirm this shortly.\n\n"
+            f"-- Talentbridge Consulting"
+        )
+    else:
+        confirmation_body = (
             f"Hi {req.customer_name},\n\n"
             f"Thanks for the conversation today. Here's what we've noted so far:\n\n"
             f"{req.requirements_summary or 'We will follow up to confirm your requirements.'}\n\n"
             f"Our recruitment team will follow up with you shortly.\n\n"
             f"-- Talentbridge Consulting"
-        ),
+        )
+
+    confirmation_result = send_client_confirmation(
+        req.email, "Thanks for reaching out to Talentbridge Consulting", confirmation_body
     )
 
     record = {
@@ -610,6 +650,8 @@ async def create_lead(req: CreateLeadRequest):
         "customer_name": req.customer_name,
         "email": req.email or "",
         "requirements_summary": req.requirements_summary or "",
+        "preferred_meeting_time": req.preferred_meeting_time or "",
+        "calendar": calendar_result,
         "notification_email": internal_email_result,
         "sheet": sheet_result,
         "client_confirmation": confirmation_result,
@@ -682,12 +724,14 @@ async def escalate_to_human(req: EscalateRequest):
 async def health():
     return {
         "status": "ok",
-        "tools": [
+        "active_tools": [
             "get_staffing_quote",
             "search_service_info",
-            "book_meeting",
-            "create_lead",
+            "create_lead",  # now also handles meeting requests via preferred_meeting_time
             "escalate_to_human",
+        ],
+        "deprecated_endpoints_still_present": [
+            "book_meeting"  # kept in code for reference/manual use, no longer called by Agora -- see README
         ],
     }
 
