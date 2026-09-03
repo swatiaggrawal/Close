@@ -91,14 +91,30 @@ ESCALATION_EMAIL_TO = os.environ.get("ESCALATION_EMAIL_TO", "")
 ESCALATION_EMAIL_FROM = os.environ.get("ESCALATION_EMAIL_FROM", "onboarding@resend.dev")
 
 
+import re
+
+_EMAIL_RE = re.compile(r"^[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}$")
+
+
+def normalize_email(value: str) -> str:
+    """Strips whitespace and lowercases -- emails are effectively
+    case-insensitive in practice, and voice transcription of spelled-out
+    addresses (e.g. a client saying 'capital S' while spelling their
+    name) can otherwise leave stray casing or whitespace that trips up
+    stricter validators like Resend's."""
+    if not value:
+        return ""
+    return value.strip().replace(" ", "").lower()
+
+
 def _looks_like_email(value: str) -> bool:
-    """Cheap heuristic gate before attempting to send -- not full RFC
-    validation, just enough to avoid wasting an API call on a phone
-    number or 'not provided'."""
+    """Real regex validation (not just an '@' check) -- catches
+    malformed addresses from ASR mistranscription (e.g. a literal word
+    like 'capital' or a stray space ending up inside the string)
+    BEFORE we waste a Resend API call on something that will 422."""
     if not value:
         return False
-    v = value.strip()
-    return "@" in v and "." in v.split("@")[-1] and " " not in v
+    return bool(_EMAIL_RE.match(normalize_email(value)))
 
 
 def send_notification_email(subject: str, body_text: str, to_address: str) -> dict:
@@ -156,10 +172,15 @@ def send_client_confirmation(to_address: str, subject: str, body_text: str) -> d
     outcome from the problem statement, made real rather than just
     logged. Only attempts to send if to_address looks like a real
     email; otherwise returns a clear 'skipped' status without wasting
-    an API call or treating it as an error."""
-    if not _looks_like_email(to_address):
-        return {"sent": False, "detail": "skipped -- no valid client email available"}
-    return send_notification_email(subject, body_text, to_address)
+    an API call or treating it as an error. Normalizes (strips +
+    lowercases) before validating/sending -- ASR mistranscription of
+    spelled-out emails (e.g. a client saying 'capital S' while
+    spelling their name) is the most common cause of a technically-
+    wrong-case or stray-whitespace address reaching here."""
+    clean = normalize_email(to_address)
+    if not _looks_like_email(clean):
+        return {"sent": False, "detail": f"skipped -- '{to_address}' doesn't look like a valid email after cleanup"}
+    return send_notification_email(subject, body_text, clean)
 
 
 # ---------------------------------------------------------------------

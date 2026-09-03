@@ -304,3 +304,26 @@ def test_looks_like_email_helper():
     assert _looks_like_email("711-930-926") is False
     assert _looks_like_email("Not provided") is False
     assert _looks_like_email("") is False
+
+
+def test_normalize_email_strips_and_lowercases():
+    from main import normalize_email
+    assert normalize_email("  Swati@Example.COM  ") == "swati@example.com"
+    assert normalize_email("SWATI@GMAIL.COM") == "swati@gmail.com"
+
+
+def test_looks_like_email_catches_asr_mistranscription():
+    """Simulates the real bug reported: ASR mangling a spelled-out
+    email with stray whitespace/casing from spelled-out speech should
+    normalize to valid. NOTE: a stray transcribed WORD (e.g. literally
+    'capital') that lands inside the local-part is syntactically
+    indistinguishable from a real username by regex alone --
+    'capitalswati@gmail.com' IS a valid email shape even though it's
+    wrong. That failure mode needs the system prompt fix (reading the
+    address back for confirmation), not server-side validation -- this
+    test documents that boundary rather than claiming to solve it."""
+    from main import _looks_like_email, normalize_email
+    # stray whitespace + mixed case from spelled-out speech -- should normalize to valid
+    assert _looks_like_email(normalize_email(" Swati AGG357 @ Gmail.com ".replace(" ", ""))) is True
+    # a genuinely malformed address (no domain) is still correctly rejected
+    assert _looks_like_email(normalize_email("swati at gmail")) is False
