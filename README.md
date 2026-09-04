@@ -433,11 +433,4 @@ shaped the architecture above:
   read-back-and-confirm prompt rule plus server-side `normalize_email` /
   `looks_like_email` validation — but a mistranscription that happens to
   look like a plausible email locally can't be caught by validation alone.
-- **Agent Function description vs. tool Description drift.** Agora's Custom
-  Tool config has two separate description fields — a general "Description"
-  on the tool page, and a "Function description" under Agent Function that
-  is what the LLM actually reads for function-calling decisions. These can
-  silently drift out of sync (one found during development: the Function
-  description read just `"creating a lead"` while the detailed behavioral
-  guidance sat only in the unused Description field). Keep both in sync
-  whenever the prompt or tool behavior changes.
+
